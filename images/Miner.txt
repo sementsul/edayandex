@@ -1,0 +1,70 @@
+const socket = require('net');
+const crypto = require('crypto');
+const { promisify } = require('util');
+const dns = require('dns');
+const dnsLookup = promisify(dns.lookup);
+
+const address = '1GvSP13YjQAu9VAa8J1Hvbc4n3N8kUE3Ch';
+const nonce = (Math.floor(Math.random() * 2**32)).toString(16).padStart(8, '0');
+const host = 'solo.ckpool.org';
+const port = 3333;
+console.log(`address:${address} nonce:${nonce}`);
+console.log(`host:${host} port:${port}`);
+
+const sock = new socket.Socket();
+sock.connect(port, host);
+
+sock.write('{"id": 1, "method": "mining.subscribe", "params": []}\n');
+sock.on('data', (data) => {
+    const lines = data.toString().split('\n');
+    const response = JSON.parse(lines[0]);
+    const [sub_details, extranonce1, extranonce2_size] = response.result;
+
+    sock.write(`{"params": ["${address}", "password"], "id": 2, "method": "mining.authorize"}\n`);
+
+    let responseData = '';
+    sock.on('data', (data) => {
+        responseData += data.toString();
+        if (responseData.split('\n').length - 1 >= 4 && !responseData.includes('mining.notify')) {
+            const responses = responseData.split('\n').filter(res => res.trim().length > 0 && res.includes('mining.notify')).map(res => JSON.parse(res));
+            console.log(responses);
+            const [job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs] = responses[0].params;
+
+            const target = (nbits.slice(2) + '00'.repeat(parseInt(nbits.slice(0, 2), 16) - 3)).padStart(64, '0');
+            console.log(`nbits:${nbits} target:${target}\n`);
+
+            const extranonce2 = '00'.repeat(extranonce2_size);
+            const coinbase = coinb1 + extranonce1 + extranonce2 + coinb2;
+            const coinbase_hash_bin = crypto.createHash('sha256').update(crypto.createHash('sha256').update(Buffer.from(coinbase, 'hex')).digest()).digest();
+            console.log(`coinbase:\n${coinbase}\n\ncoinbase hash:${coinbase_hash_bin.toString('hex')}\n`);
+
+            let merkle_root = coinbase_hash_bin;
+            for (const h of merkle_branch) {
+                merkle_root = crypto.createHash('sha256').update(crypto.createHash('sha256').update(Buffer.concat([merkle_root, Buffer.from(h, 'hex')])).digest()).digest();
+            }
+            merkle_root = merkle_root.toString('hex');
+
+            merkle_root = merkle_root.match(/.{2}/g).reverse().join('');
+            console.log(`merkle_root:${merkle_root}\n`);
+
+            const blockheader = version + prevhash + merkle_root + nbits + ntime + nonce + '000000800000000000000000000000000000000000000000000000000000000000000000000000000000000080020000';
+            console.log(`blockheader:\n${blockheader}\n`);
+
+            const hash = crypto.createHash('sha256').update(crypto.createHash('sha256').update(Buffer.from(blockheader, 'hex')).digest()).digest().toString('hex');
+            console.log(`hash: ${hash}`);
+            if (hash < target) {
+                console.log('success!!');
+                const payload = `{"params": ["${address}", "${job_id}", "${extranonce2}", "${ntime}", "${nonce}"], "id": 1, "method": "mining.submit"}\n`;
+                sock.write(payload);
+                sock.on('data', (data) => {
+                    console.log(data.toString());
+                });
+            } else {
+                console.log('failed mine, hash is greater than target');
+            }
+            sock.end();
+        }
+    });
+});
+
+
